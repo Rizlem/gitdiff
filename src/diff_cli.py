@@ -10,6 +10,7 @@ config = load_config()
 WEBHOOK_URL = config.get("discord", {}).get("webhook_url", "")
 MAX_LENGTH = config.get("cli", {}).get("max_chunk_length", 1980)
 DELAY_SECONDS = config.get("cli", {}).get("delay_seconds", 1)
+END_SIGNAL = "<<<GMD_END_OF_DIFF_7f3a>>>"
 
 USER_MAPPINGS = {}
 DISCORD_USER_MAPPINGS = {}
@@ -68,12 +69,31 @@ def get_git_diff():
     except FileNotFoundError:
         return None
 
-# Transmits a provided text payload to the Discord channel.
-def send_to_discord(content):
-    """Sends an HTTP POST request containing the message content to the Discord webhook URL."""
-    message_data = {"content": content}
-    response = requests.post(WEBHOOK_URL, json=message_data)
-    return response.status_code == 204
+def send_to_discord(content, retries=5):
+    """POST to the webhook, retrying on rate limits. Returns True on success."""
+    payload = {"content": content}
+    for _ in range(retries):
+        try:
+            response = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+        except requests.RequestException as e:
+            print(f"Webhook request error: {e}")
+            time.sleep(1)
+            continue
+
+        if response.status_code in (200, 204):
+            return True
+
+        if response.status_code == 429:
+            try:
+                wait = float(response.json().get("retry_after", 1))
+            except Exception:
+                wait = 1
+            time.sleep(wait + 0.1)
+            continue
+
+        print(f"Webhook failed: {response.status_code} {response.text[:200]}")
+        return False
+    return False
 
 # Chunks and formats the diff string, adds metadata, and sends to Discord.
 def process_and_send_diff(result):
@@ -89,15 +109,22 @@ def process_and_send_diff(result):
     discord_user = DISCORD_USER_MAPPINGS.get(shortcode, "UNKNOWN_USER")
     
     cleaned_result = clean_diff_output(result)
-    lines = cleaned_result.splitlines()
-    
+
+    # Split any single line that is too long to fit in one message
+    piece_size = MAX_LENGTH - 50
+    lines = []
+    for line in cleaned_result.splitlines():
+        while len(line) > piece_size:
+            lines.append(line[:piece_size])
+            line = line[piece_size:]
+        lines.append(line)
+
     current_chunk = f"Email: {user_email} | Shortcode: {shortcode} | Discord User: {discord_user}\n"
     all_successful = True
 
     for line in lines:
         if len(current_chunk) + len(line) + 1 > MAX_LENGTH:
-            success = send_to_discord(f"```diff\n{current_chunk}\n```")
-            if not success:
+            if not send_to_discord(f"```diff\n{current_chunk}\n```"):
                 all_successful = False
             current_chunk = line + "\n"
             time.sleep(DELAY_SECONDS)
@@ -105,13 +132,14 @@ def process_and_send_diff(result):
             current_chunk += line + "\n"
 
     if current_chunk.strip():
-        success = send_to_discord(f"```diff\n{current_chunk}\n```")
-        if not success:
+        if not send_to_discord(f"```diff\n{current_chunk}\n```"):
             all_successful = False
+        time.sleep(DELAY_SECONDS)  # pause before the end signal to avoid a 429
 
-    # Tells the bot we are done sending chunks
-    send_to_discord("[END OF DIFF]")
-            
+    # Tell the bot we are done, and count a failure here as a real failure
+    if not send_to_discord(END_SIGNAL):
+        all_successful = False
+
     return all_successful
 
 # Orchestrates the script execution and handles cosmetic terminal outputs.
